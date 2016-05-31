@@ -1,0 +1,294 @@
+= libdtrace =
+
+== Overview ==
+
+=== Example ===
+An obvious example is dtrace(1). Furthermore you can use mintrace submitted in [1] as a reference - it is basically a trimmed down (1/3 original SLOC) dtrace(1).
+
+=== Undocumented ===
+According to libdtrace(3LIB) man page, the API is not documented because it is unstable.This means two important things: we have to figure it out ''and'' [wiki:TclDtrace TclDTrace] is supposed to be broken somewhere in the future. 
+
+=== Flow ===
+Using libdtrace can be broken into general steps:
+ 1. Opening with '''dtrace_open''' - this gives us a Dtrace handle used in all other functions.
+ 1. Setting options with '''dtrace_setopt''' - they affect inner workings of the lib.
+ 1. Registering callback handlers for some specific Dtrace events.
+ 1. Compiling the program with '''dtrace_program_fcompile''' if you're using a script, or '''dtrace_program_strcompile''' if directly from a string.
+ 1. Enabling instrumentation - exec the compiled program with '''dtrace_program_exec'''.
+ 1. Enabling tracing with '''dtrace_go'''.
+ 1. Tracing loop - each iteration consists of '''dtrace_sleep''' and '''dtrace_work'''. We have to provide a pointer to results processing function to '''dtrace_work'''.
+ 1. Disabling tracing with '''dtrace_stop'''.
+ 1. Printing aggregations with '''dtrace_aggregate_print'''.
+ 1. Quit gracefully with '''dtrace_close'''.
+
+Note: original dtrace(1) allows different flows, like only listing matching probes, or only compiling programs. There is ''DTRACE_O_NODEV'' flag for '''dtrace_open''' if you want a copy that's unable to actually trace.
+
+== Functions ==
+
+=== Open/close the lib ===
+{{{
+#!C
+dtrace_hdl_t *dtrace_open(int version, int flags, int *error);
+void dtrace_close(dtrace_hdl_t *handle);
+}}}
+All other commands rely on the Dtrace handle. ''DTRACE_VERSION'' is defined in the ''dtrace.h'' and corresponds to the API version (currently 3). The ''error'' can be printed nicely with the '''dtrace_errmsg''' function. Currently recognized flags are:
+{{{
+#!C
+#define DTRACE_O_NODEV          0x01    /* do not open dtrace(7D) device */
+#define DTRACE_O_NOSYS          0x02    /* do not load /system/object modules */
+#define DTRACE_O_LP64           0x04    /* force D compiler to be LP64 */
+#define DTRACE_O_ILP32          0x08    /* force D compiler to be ILP32 */
+#define DTRACE_O_MASK           0x0f    /* mask of valid flags to dtrace_open */
+}}}
+Note that '''dtrace_close''' is needed to prevent an epic fail. It does a major cleanup, that involves restoring the state of all grabbed processes, which may be all processes in the system...
+
+=== Setting options ===
+{{{
+#!C
+int dtrace_setopt(dtrace_hdl_t *handle, char *name, char *value);
+int dtrace_getopt(dtrace_hdl_t *handle, char *name, dtrace_optval_t *value);
+}}}
+The cool thing about libdtrace API is that it's options almost are a 1-1 binding to dtrace(1) options. These have meaningful names here, see below for full list with explanations. You can get back the value for an option, in case something changed it (grabbing anonymous state does). Returns value other than 0 on error (possibly ''EDT_BADOPTNAME''). The dtrace_optval_t is typedefed as int64_t.
+
+=== Callbacks ===
+Dtrace wants a whole bunch of these:
+{{{
+#!C
+static void
+prochandler(struct ps_prochandle *P, const char *msg, void *arg)
+static int
+errhandler(const dtrace_errdata_t *data, void *arg)
+static int
+drophandler(const dtrace_dropdata_t *data, void *arg)
+static int
+setopthandler(const dtrace_setoptdata_t *data, void *arg)
+static int
+bufhandler(const dtrace_bufdata_t *bufdata, void *arg)
+}}}
+They're called by libdtrace in case of certain events. You have to load them like:
+{{{
+#!C
+if (dtrace_handle_err(g_dtp, &errhandler, NULL) == -1)
+        dfatal("failed to establish error handler");
+
+if (dtrace_handle_drop(g_dtp, &drophandler, NULL) == -1)
+        dfatal("failed to establish drop handler");
+
+if (dtrace_handle_proc(g_dtp, &prochandler, NULL) == -1)
+        dfatal("failed to establish proc handler");
+
+if (dtrace_handle_setopt(g_dtp, &setopthandler, NULL) == -1)
+        dfatal("failed to establish setopt handler");
+
+if (g_ofp == NULL &&
+    dtrace_handle_buffered(g_dtp, &bufhandler, NULL) == -1)
+        dfatal("failed to establish buffered handler");
+}}}
+Where g_dtp is the handle to libdtrace. See also [wiki:LibDtrace#Bufferedoutput Buffered output].
+
+=== Compiling ===
+{{{
+#!C
+dtrace_prog_t *dtrace_program_fcompile (dtrace_hdl_t *handle,
+    FILE *source, int cflags, int argc, char **argv);
+dtrace_prog_t *dtrace_program_strcompile (dtrace_hdl_t *handle,
+    char *source, dtrace_probespec_t c_spec, int cflags, 
+    int argc, char **argv);
+}}}
+
+Pretty straightforward. The only twist is gibing ''argc'' and ''argv'' here. The ''c_spec'' option means probe specifier context, for libdtrace to know what kind of probe specifiers are inside the script.
+
+=== Running ===
+{{{
+#!C
+int dtrace_program_exec(dtrace_hdl_t *handle, dtrace_prog_t *program, 
+    dtrace_proginfo_t *program_info);
+void dtrace_program_info(dtrace_hdl_t *handle, dtrace_prog_t *program, 
+    dtrace_proginfo_t *program_info);
+void dtrace_go(dtrace_hdl_t *handle);
+int dtrace_stop(dtrace_hdl_t *handle);
+}}}
+
+The '''dtrace_program_exec''' call enables the instrumentation. If we're interested only in the returned information, the second call is for us. Probably the most generally interesting field in it is ''dtrace_proginfo_t.dpi_matches'' which tells us the number of probes matched. Returns -1 on error. Finally '''dtrace_go''' starts tracing. This can change buffer sizes and/or rates settings - could be nice to know what actually fired. There is nothing interesting in '''dtrace_stop''' - it just stops things ticking.
+
+=== Tracing loop and printing ===
+{{{
+#!C
+void dtrace_sleep(dtrace_hdl_t *handle);
+dtrace_workstatus_t dtrace_work(dtrace_hdl_t *handle, FILE *output,
+    dtrace_consume_probe_f *pfunc, dtrace_consume_rec_f *rfunc, void *arg);
+int dtrace_aggregate_print(dtrace_hdl_t *handle, FILE *output,
+    dtrace_aggregate_walk_f *func);
+
+}}}
+
+The '''dtrace_sleep''' call waits until something interesting happens, but no longer than a specific number of nanoseconds set up in the handle. The '''dtrace_work''' call is central for getting any work done. The ''arg'' gets paseed to both ''pfunc'' and ''rfunc''. The ''output'' file is where data printed by your scripts goes (like using the ''trace'' statement). All other output should be constructed in the consuming functions. Finally the '''dtrace_aggregate_print''' is also one-shot to dump the results of any aggregations used. The ''dtrace_aggregate_walk_f'' should be left ''NULL'', unless a better idea comes.
+
+
+The most verbose function in original dtrace(1) is the probe consuming function:
+{{{
+#!C
+static int chew(const dtrace_probedata_t *data, void *arg);
+static int chewrec(const dtrace_probedata_t *data, 
+    const dtrace_recdesc_t *rec, void *arg)
+}}}
+At the same time the record consuming function does not do much. Both functions should return ''DTRACE_CONSUME_THIS'' on successful consumption and ''DTRACE_CONSUME_ABORT'' in case of an error/interruption. The record chewing function should return ''DTRACE_CONSUME_NEXT'' after consuming the last available record (''rec == NULL'' or ''rec->dtrd_action == DTRACEACT_EXIT''). The probe data contains all the interesting information:
+{{{
+#!C
+typedef struct dtrace_probedata {
+        dtrace_hdl_t *dtpda_handle;             /* handle to DTrace library */
+        dtrace_eprobedesc_t *dtpda_edesc;       /* enabled probe description */
+        dtrace_probedesc_t *dtpda_pdesc;        /* probe description */
+        processorid_t dtpda_cpu;                /* CPU for data */
+        caddr_t dtpda_data;                     /* pointer to raw data */
+        dtrace_flowkind_t dtpda_flow;           /* flow kind */
+        const char *dtpda_prefix;               /* recommended flow prefix */
+        int dtpda_indent;                       /* recommended flow indent */
+} dtrace_probedata_t;
+
+typedef struct dtrace_probedesc {
+    dtrace_id_t dtpd_id;			/* probe identifier */
+    char dtpd_provider[DTRACE_PROVNAMELEN]; /* probe provider name */
+    char dtpd_mod[DTRACE_MODNAMELEN];	/* probe module name */
+    char dtpd_func[DTRACE_FUNCNAMELEN];	/* probe function name */
+    char dtpd_name[DTRACE_NAMELEN];		/* probe name */
+} dtrace_probedesc_t;
+}}}
+
+Of general interest, we have here indication of what actually fired. That is the probe description, flow kind (entry, return, none) and on which CPU did it happen. The raw data seems to be internal, with structure dependent on what is currently happening.
+
+Records are pretty much internal beings of Dtrace, representing some metadata. In the original dtrace(1) chewrec function they are simply ignored. It seems reasonable to assume, that on the level of abstraction we're interested in, they are no use for us.
+ 
+=== Buffered output ===
+
+When '''dtrace_work''' is given ''NULL'' as the output file pointer, it instead buffers all your script output and passes it to the ''buffered handler''. The definitions are:
+{{{
+#!C
+int bufhandler(const dtrace_bufdata_t *bufdata, void *arg);
+
+typedef struct dtrace_bufdata {
+        dtrace_hdl_t *dtbda_handle;             /* handle to DTrace library */
+        const char *dtbda_buffered;             /* buffered output */
+        dtrace_probedata_t *dtbda_probe;        /* probe data */
+        const dtrace_recdesc_t *dtbda_recdesc;  /* record description */
+        const dtrace_aggdata_t *dtbda_aggdata;  /* aggregation data, if agg. */
+        uint32_t dtbda_flags;                   /* flags; see above */
+} dtrace_bufdata_t;
+}}}
+The ''arg'' is the same thing you pass to '''dtrace_work'''. We can say what kind of data we got by examining ''bufdata->dtbda_recdesc->dtrd_action''. Possible values:
+{{{
+#!C
+#define	DTRACEACT_NONE			0	/* no action */
+#define	DTRACEACT_DIFEXPR		1	/* action is DIF expression */
+#define	DTRACEACT_EXIT			2	/* exit() action */
+#define	DTRACEACT_PRINTF		3	/* printf() action */
+#define	DTRACEACT_PRINTA		4	/* printa() action */
+#define	DTRACEACT_LIBACT		5	/* library-controlled action */
+#define	DTRACEACT_BRENDAN		6	/* brendan() action */
+
+#define	DTRACEACT_PROC			0x0100
+#define	DTRACEACT_USTACK		(DTRACEACT_PROC + 1)
+#define	DTRACEACT_JSTACK		(DTRACEACT_PROC + 2)
+#define	DTRACEACT_USYM			(DTRACEACT_PROC + 3)
+#define	DTRACEACT_UMOD			(DTRACEACT_PROC + 4)
+#define	DTRACEACT_UADDR			(DTRACEACT_PROC + 5)
+
+#define	DTRACEACT_PROC_DESTRUCTIVE	0x0200
+#define	DTRACEACT_STOP			(DTRACEACT_PROC_DESTRUCTIVE + 1)
+#define	DTRACEACT_RAISE			(DTRACEACT_PROC_DESTRUCTIVE + 2)
+#define	DTRACEACT_SYSTEM		(DTRACEACT_PROC_DESTRUCTIVE + 3)
+#define	DTRACEACT_FREOPEN		(DTRACEACT_PROC_DESTRUCTIVE + 4)
+
+#define	DTRACEACT_PROC_CONTROL		0x0300
+
+#define	DTRACEACT_KERNEL		0x0400
+#define	DTRACEACT_STACK			(DTRACEACT_KERNEL + 1)
+#define	DTRACEACT_SYM			(DTRACEACT_KERNEL + 2)
+#define	DTRACEACT_MOD			(DTRACEACT_KERNEL + 3)
+
+#define	DTRACEACT_KERNEL_DESTRUCTIVE	0x0500
+#define	DTRACEACT_BREAKPOINT		(DTRACEACT_KERNEL_DESTRUCTIVE + 1)
+#define	DTRACEACT_PANIC			(DTRACEACT_KERNEL_DESTRUCTIVE + 2)
+#define	DTRACEACT_CHILL			(DTRACEACT_KERNEL_DESTRUCTIVE + 3)
+
+#define	DTRACEACT_SPECULATIVE		0x0600
+#define	DTRACEACT_SPECULATE		(DTRACEACT_SPECULATIVE + 1)
+#define	DTRACEACT_COMMIT		(DTRACEACT_SPECULATIVE + 2)
+#define	DTRACEACT_DISCARD		(DTRACEACT_SPECULATIVE + 3)
+
+#define	DTRACEACT_CLASS(x)		((x) & 0xff00)
+
+#define	DTRACEACT_ISDESTRUCTIVE(x)	\
+	(DTRACEACT_CLASS(x) == DTRACEACT_PROC_DESTRUCTIVE || \
+	DTRACEACT_CLASS(x) == DTRACEACT_KERNEL_DESTRUCTIVE)
+
+#define	DTRACEACT_ISSPECULATIVE(x)	\
+	(DTRACEACT_CLASS(x) == DTRACEACT_SPECULATIVE)
+
+#define	DTRACEACT_ISPRINTFLIKE(x)	\
+	((x) == DTRACEACT_PRINTF || (x) == DTRACEACT_PRINTA || \
+	(x) == DTRACEACT_SYSTEM || (x) == DTRACEACT_FREOPEN)
+}}}
+
+=== Misc ===
+{{{
+#!C
+int dtrace_errno(dtrace_hdl_t *handle);
+char *dtrace_errmsg(dtrace_hdl_t *handle, int error);
+}}}
+
+Those two are pretty self-explanatory: get the error number and convert it into a human-readable form.
+
+== Options ==
+
+Many dtrace(1) options translate into libdtrace options set by '''dtrace_setopt'''. Here is the table:
+
+|| '''dtrace(1) option''' || '''LibDtrace option''' || '''Remarks''' ||
+|| -32 | -64 ||  || Set the ''DTRACE_O_LP64'' and ''DTRACE_O_ILP32'' flags for opening LibDtrace instead. ||
+||-a  || grabanon || ||
+||-A  ||  ||  ||
+|| -b bufsz || bufsize || ||
+|| -c cmd || || Process started with '''dtrace_proc_create'''.||
+|| -C || || Set the ''DTRACE_C_CPP'' C flag instead. ||
+|| -D name [=value] || define || ||
+|| -e || || ||
+|| -f[[provider:]module:]function[[predicate]action]] || || Transformed into appropriate ''dtrace_cmd_t''. ||
+|| -F || flowindent || Note you still need to indent manually if you're going to print own data. ||
+|| -G || || Set the ''DTRACE_O_NODEV'' flag for opening LibDtrace and ''DTRACE_C_ZDEFS'' C flag instead. ||
+|| -H || cpphdrs || ||
+|| -h || || Set the ''DTRACE_O_NODEV'' flag for opening LibDtrace and ''DTRACE_C_ZDEFS'' C flag instead. ||
+|| -i probe-id[[predicate] action] || || Transformed into appropriate ''dtrace_cmd_t''. ||
+|| -I path || incdir || ||
+|| -L path || libdir || ||
+|| -l || || Set the 'DTRACE_C_ZDEFS'' C flag instead. ||
+|| -m [[provider:] module: [[predicate] action]] || || Transformed into appropriate ''dtrace_cmd_t''. ||
+|| -n [[[provider:] module:] function:] name [[predicate] || || Transformed into appropriate ''dtrace_cmd_t''.||
+|| -o output || || ||
+|| -p pid || || Process grabbed with '''dtrace_proc_grab'''. ||
+|| -P provider [[predicate] action] || || Transformed into appropriate ''dtrace_cmd_t''. ||
+|| -q || quiet || ||
+|| -s || || Transformed into appropriate ''dtrace_cmd_t''.||
+|| -S || || Set the ''DTRACE_C_DIFV'' C flag instead. ||
+|| -U name || undef || ||
+|| -v || || ||
+|| -V || || ||
+|| -w || destructive || ||
+|| -x arg [=val] || || Allows for setting the options on the bottom of the table. ||
+|| -X a | c | s | t || stdc || ||
+|| -Z || || Set the ''DTRACE_C_ZDEFS'' C flag instead. ||
+|| || aggsize || Not described in dtrace(1) manual. Sets the aggregation data size limit. ||
+|| || linkmode || Not described in dtrace(1) manual. Sets the linker mode. Should be set to ''primary'' unless we just want to get an object file, when ''dynamic'' should be used. ||
+|| || unodefs || Not described in dtrace(1) manual. Allows for usage of undefined symbols. Should be used for object file creation. Binary option. ||
+
+Let ''optarg'' be a string in the format used at CLI.  To actually set a binary option, we give ''0'' as ''optarg''.
+
+== Apple version differences ==
+This is the list of spotted differences between LibDtrace under Solaris and OSX. It can grow as we proceed with #3.
+
+The apple version:
+ * Doesn't accept -X
+ * Calls '''dtrace_proc_continue''' and '''dtrace_proc_release''' manually (Solaris has that embedded into '''dtrace_close''').
+ * Has two new options ''stacksymbols'' (values: ''enabled''/''disabled'') and ''arch'' (values ''i386''/''x86_64''/''ppc''/''ppc64''). 
+ * Worries about endianness.
+
+Furthermore Apple wants us to demangle function names for C++ and be more careful with argv's for programs we run.
