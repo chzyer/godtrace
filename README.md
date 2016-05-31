@@ -1,5 +1,8 @@
-## Godtrace
+# Godtrace
 dtrace in Go
+
+## Usage
+see [godtrace](cmd/godtrace)
 
 ### Enable kernel modules in EI Capitan
 
@@ -18,6 +21,7 @@ From the Utilities menu, run Terminal
 csrutil enable --without dtrace
 reboot
 ```
+
 
 ### Libdtrace document
 http://dev.lrem.net/tcldtrace/wiki/LibDtrace
