@@ -22,8 +22,18 @@ func goChew(data *C.dtrace_probedata_t, arg unsafe.Pointer) C.int {
 func (h *Handle) SetHandlerFunc(f func(*ProbeData) int) {
 	h.probe = f
 }
+
 func (h *Handle) SetRecHandlerFunc(f func(*ProbeData, *RecDesc) int) {
 	h.rec = f
+}
+
+func (h *Handle) Run() (WorkStatus, error) {
+	h.Sleep()
+	status := h.Work()
+	if status == WS_ERROR {
+		return status, h.GetError()
+	}
+	return status, nil
 }
 
 func (h *Handle) Work() WorkStatus {
@@ -37,11 +47,14 @@ func (h *Handle) Work() WorkStatus {
 	} else {
 		r = (*C.dtrace_consume_rec_f)(C.dumpChewrec)
 	}
-	status := C.dtrace_work(h.handle, C.stdout, p, r, unsafe.Pointer(h))
-	return WorkStatus(status)
+	return WorkStatus(C.dtrace_work(h.handle, nil, p, r, unsafe.Pointer(h)))
 }
 
 type WorkStatus int
+
+func (w WorkStatus) IsOK() bool {
+	return w == WS_OKAY
+}
 
 const (
 	WS_ERROR WorkStatus = C.DTRACE_WORKSTATUS_ERROR
@@ -165,4 +178,20 @@ func (p *ProbeDesc) Func() string {
 }
 func (p *ProbeDesc) Name() string {
 	return C.GoString(&p.dtpd_name[0])
+}
+
+// -----------------------------------------------------------------------------
+// typedef struct dtrace_bufdata {
+//     dtrace_hdl_t *dtbda_handle;              /* handle to DTrace library */
+//     const char *dtbda_buffered;              /* buffered output */
+//     dtrace_probedata_t *dtbda_probe;         /* probe data */
+//     const dtrace_recdesc_t *dtbda_recdesc;   /* record description */
+//     const dtrace_aggdata_t *dtbda_aggdata;   /* aggregation data, if agg. */
+//     uint32_t dtbda_flags;                    /* flags; see above */
+// } dtrace_bufdata_t;
+
+type BufData C.dtrace_bufdata_t
+
+func (b *BufData) Buffered() string {
+	return C.GoString(b.dtbda_buffered)
 }

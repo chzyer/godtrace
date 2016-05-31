@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"fmt"
 	"os"
 
 	"github.com/chzyer/godtrace"
@@ -15,7 +17,7 @@ func process() error {
 
 	handle.SetBufSize("4m")
 
-	prog, err := handle.Compile("syscall::read: { printf(\"a-%d\\n\", uid) } tick-1sec { exit(0) }",
+	prog, err := handle.Compile("syscall::read: { printf(\"a-%d-\\n\", uid) } tick-1sec { exit(0) }",
 		godtrace.ProbeSpecName, godtrace.C_PSPEC, nil)
 	if err != nil {
 		return err
@@ -26,14 +28,29 @@ func process() error {
 	}
 	println("matches:", info.Matches())
 
+	pr, err := handle.ConsumePipe()
+	if err != nil {
+		return err
+	}
+	defer pr.Close()
+
+	go func() {
+		scanner := bufio.NewScanner(pr)
+		for scanner.Scan() {
+			println("-", scanner.Text())
+		}
+	}()
+
 	if err := handle.Go(); err != nil {
 		return err
 	}
 
 	for {
-		handle.Sleep()
-		status := handle.Work()
-		if status != godtrace.WS_OKAY {
+		status, err := handle.Run()
+		if err != nil {
+			return fmt.Errorf("run error: %v", err)
+		}
+		if !status.IsOK() {
 			break
 		}
 	}
